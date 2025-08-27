@@ -1,0 +1,91 @@
+pipeline {
+  agent any
+  options { timestamps() }
+
+  parameters {
+    string(name: 'AWS_ACCOUNT_ID', defaultValue: '975050170292', description: 'AWS Account ID')
+    string(name: 'AWS_REGION',     defaultValue: 'ap-southeast-1', description: 'Region')
+    string(name: 'ECR_REPO',       defaultValue: 'rmit-store-backend', description: 'ECR repo name')
+    string(name: 'DOCKERFILE',     defaultValue: 'backend/Dockerfile', description: 'Dockerfile path')
+    string(name: 'BUILD_CONTEXT',  defaultValue: 'backend', description: 'Docker build context')
+    booleanParam(name: 'RUN_TESTS', defaultValue: false, description: 'Run npm tests in a Node container')
+    booleanParam(name: 'DEPLOY_TO_EKS', defaultValue: false, description: 'Deploy to EKS after push')
+    string(name: 'EKS_CLUSTER',   defaultValue: 'rmit-store-dev', description: 'EKS cluster name')
+    string(name: 'K8S_NAMESPACE', defaultValue: 'rmit-dev', description: 'K8s namespace')
+    string(name: 'K8S_DEPLOYMENT',defaultValue: 'backend', description: 'K8s Deployment name')
+    string(name: 'K8S_CONTAINER', defaultValue: 'backend', description: 'Container name in the Deployment')
+  }
+
+  environment {
+    ECR_REGISTRY = "${params.AWS_ACCOUNT_ID}.dkr.ecr.${params.AWS_REGION}.amazonaws.com"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+        script { env.IMG_TAG = sh(returnStdout:true, script:'git rev-parse --short HEAD').trim()+"-${env.BUILD_NUMBER}" }
+        echo "Image tag: ${env.IMG_TAG}"
+      }
+    }
+
+    stage('Login to ECR') {
+      steps {
+        sh 'aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY'
+      }
+    }
+
+    stage('Ensure ECR repo') {
+      steps {
+        sh 'aws ecr describe-repositories --repository-names $ECR_REPO --region $AWS_REGION || aws ecr create-repository --repository-name $ECR_REPO --region $AWS_REGION'
+      }
+    }
+
+    stage('Test (optional)') {
+      when { expression { return params.RUN_TESTS } }
+      steps {
+        sh '''
+          if [ -f ${BUILD_CONTEXT}/package.json ]; then
+            docker run --rm -v "$PWD/${BUILD_CONTEXT}":/app -w /app node:20-bullseye \
+              bash -lc "npm ci && npm test --if-present"
+          else
+            echo "No package.json in ${BUILD_CONTEXT}; skipping tests"
+          fi
+        '''
+      }
+    }
+
+    stage('Build image') {
+      steps {
+        sh 'docker build -f "$DOCKERFILE" -t "$ECR_REPO:$IMG_TAG" "$BUILD_CONTEXT"'
+      }
+    }
+
+    stage('Push image') {
+      steps {
+        sh '''
+          docker tag  $ECR_REPO:$IMG_TAG $ECR_REGISTRY/$ECR_REPO:$IMG_TAG
+          docker push $ECR_REGISTRY/$ECR_REPO:$IMG_TAG
+          echo "image=$ECR_REGISTRY/$ECR_REPO:$IMG_TAG" > image_meta.env
+        '''
+      }
+    }
+
+    stage('Deploy to EKS (optional)') {
+      when { expression { return params.DEPLOY_TO_EKS } }
+      steps {
+        sh '''
+          source image_meta.env
+          aws eks update-kubeconfig --name ${EKS_CLUSTER} --region ${AWS_REGION}
+          kubectl -n ${K8S_NAMESPACE} set image deployment/${K8S_DEPLOYMENT} ${K8S_CONTAINER}=${image} --record
+          kubectl -n ${K8S_NAMESPACE} rollout status deployment/${K8S_DEPLOYMENT}
+        '''
+      }
+    }
+  }
+
+  post {
+    success { echo 'Backend: build & push complete ✅' }
+    always  { sh 'docker system prune -f || true' }
+  }
+}

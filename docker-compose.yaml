@@ -1,0 +1,30 @@
+services:
+  mongo:
+    image: mongo:8.0
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+
+  server:
+    build: ./server
+    restart: always
+    ports:
+      - "3000:3000"
+    env_file: ./server/.env
+    depends_on:
+      - mongo
+
+  client:
+    build: ./client
+    restart: always
+    # nginx serves on 80 inside the container; publish it to 8080 on your Mac
+    ports:
+      - "8080:80"
+    env_file: ./client/.env
+    depends_on:
+      - server
+
+volumes:
+  mongo-data:
